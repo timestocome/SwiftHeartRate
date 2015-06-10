@@ -39,7 +39,7 @@ class GraphView: UIView
         height = CGFloat(area.size.height)
         
         dataArrayX = [CGFloat](count:maxPoints, repeatedValue: 0.0)
-        scale = Float(area.height) / 255.0 * 5.0       // view height /max possible value * scaled up to show small details
+        scale = Float(area.height) * 200
         
     }
     

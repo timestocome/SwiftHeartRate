@@ -9,6 +9,7 @@
 
 
 
+
 import UIKit
 import Foundation
 import AVFoundation
@@ -21,7 +22,7 @@ import Accelerate
 
 class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDelegate
 {
-
+    
     
     // UI stuff
     @IBOutlet var graphView: GraphView!
@@ -30,16 +31,13 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     @IBOutlet var HFBandLabel: UILabel!
     @IBOutlet var LFBandLabel: UILabel!
     var timeElapsedStart:NSDate!
-        
+    
     
     // camera setup
-    var cameraOn = false
-    var stopUpdates = false
-
     var session:AVCaptureSession!
-    var videoDevice:AVCaptureDevice!
-    var videoInput:AVCaptureDeviceInput!
-    var dataOutput:AVCaptureVideoDataOutput!
+    var height = 0
+    var width = 0
+    var numberOfPixels = 0
     
     
     // used to compute frames per second
@@ -50,27 +48,31 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     // needed to init image context
     var context:CIContext!
     
-   
+    
     
     // FFT setup stuff
-    let windowSize = 256                // granularity of the measurement, error
+    let windowSize = 512               // granularity of the measurement, error
     var log2n:vDSP_Length = 0
-    let windowSizeOverTwo = 128         // for fft
-    var fps:Float = 15.0                // fps === hz
+    let windowSizeOverTwo = 256         // for fft
+    var fps:Float = 30.0                // fps === hz
     var setup:COpaquePointer!
-
+    
     
     // collects data from image and stores for fft
     var dataCount = 0           // tracks how many data points we have ready for fft
     var fftLoopCount = 0        // how often we grab data between fft calls
-    var inputSignal:[Float] = Array(count: 256, repeatedValue: 0.0)
-    let loopCount = 64          // number of data points between fft calls ~ 1 seconds = 15 frames, use a power of two
-
-   
+    var inputSignal:[Float] = Array(count: 512, repeatedValue: 0.0)
     
     
     
-
+    // data smoothing
+    var movingAverageArray:[CGFloat] = [0.0, 0.0, 0.0, 0.0, 0.0]      // used to store rolling average
+    var movingAverageCount:CGFloat = 5.0                              // window size
+    
+    
+    
+    
+    
     override func viewDidLoad() {
         super.viewDidLoad()
         
@@ -80,8 +82,9 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         
         // init graphs
         graphView.setupGraphView()
-
+        
     }
+    
     
     
     
@@ -91,53 +94,62 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     func setupCaptureSession () {
         
         var error: NSError?
-        
-        // inputs - find and use back facing camera
+        var videoDevice:AVCaptureDevice!
         let videoDevices = AVCaptureDevice.devicesWithMediaType(AVMediaTypeVideo)
         
+        
+        // inputs - find and use back facing camera
         for device in videoDevices{
             if device.position == AVCaptureDevicePosition.Back {
                 videoDevice = device as! AVCaptureDevice
             }
         }
         
-        videoInput = AVCaptureDeviceInput(device: videoDevice, error: &error )
         
-        // output
-        dataOutput = AVCaptureVideoDataOutput()
+        let videoInput = AVCaptureDeviceInput(device: videoDevice, error: &error )
+        let dataOutput = AVCaptureVideoDataOutput()
+        
+        
+        // output format
         dataOutput.videoSettings = [kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA]
-        let sessionQueue = dispatch_queue_create("AVSessionQueue", DISPATCH_QUEUE_SERIAL)
-        dataOutput.setSampleBufferDelegate(self, queue: sessionQueue)
-        
         
         
         // set up session
+        let sessionQueue = dispatch_queue_create("AVSessionQueue", DISPATCH_QUEUE_SERIAL)
+        dataOutput.setSampleBufferDelegate(self, queue: sessionQueue)
+        
         session = AVCaptureSession()
-
+        
+        
         // measure pulse from 40-230bpm = ~.5 - 4bps * 2 to remove aliasing need 8 frames/sec minimum
-        // presetLow captures 15 fps with light on, 7 with light off
-        session.sessionPreset = AVCaptureSessionPresetLow
+        // preset352x288 ~ 30fps
+        session.sessionPreset = AVCaptureSessionPreset352x288
+        height = 352
+        width = 288
+        numberOfPixels = height * width
+        
         
         // turn on light
         session.beginConfiguration()
-            videoDevice.lockForConfiguration(&error)
-                videoDevice.setTorchModeOnWithLevel(AVCaptureMaxAvailableTorchLevel, error: &error)
-            videoDevice.unlockForConfiguration()
+        videoDevice.lockForConfiguration(&error)
+        videoDevice.setTorchModeOnWithLevel(AVCaptureMaxAvailableTorchLevel, error: &error)
+        videoDevice.unlockForConfiguration()
         session.commitConfiguration()
         
         
+        // start session
         session.addInput(videoInput)
         session.addOutput(dataOutput)
-        
         session.startRunning()
-
+        
     }
     
     
     
     
-    // grab each camera image, 
-    // split into red, green, blue pixels, 
+    
+    // grab each camera image,
+    // split into red, green, blue pixels,
     // compute average red, green blue pixel value per frame
     func captureOutput(captureOutput: AVCaptureOutput!, didOutputSampleBuffer sampleBuffer: CMSampleBuffer!, fromConnection connection: AVCaptureConnection!) {
         
@@ -147,32 +159,27 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         fps = 1.0/Float(newDate.timeIntervalSinceDate(oldDate))
         oldDate = newDate
         
-
+        
         // get the image from the camera
         let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
         
         
         // lock buffer
-        CVPixelBufferLockBaseAddress(pixelBuffer, 0);
+        CVPixelBufferLockBaseAddress(pixelBuffer!, 0);
         
         // grab image info
         let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
         
         // get pointer to the pixel array
-        var src_buff = CVPixelBufferGetBaseAddress(imageBuffer)
-        var dataBuffer = UnsafeMutablePointer<UInt8>(src_buff)
+        let src_buff = CVPixelBufferGetBaseAddress(imageBuffer!)
+        let dataBuffer = UnsafeMutablePointer<UInt8>(src_buff)
         
         // unlock buffer
-        CVPixelBufferUnlockBaseAddress(imageBuffer, 0)
+        CVPixelBufferUnlockBaseAddress(imageBuffer!, 0)
         
-        // image data - should probably compute this once somewhere else
-        let height = CVPixelBufferGetHeight(imageBuffer)
-        let width = CVPixelBufferGetWidth(imageBuffer)
-        let numberOfPixels = width * height
-    
+        
         
         // compute the brightness for reg, green, blue and total
-        
         // pull out color values from pixels ---  image is BGRA
         var greenVector:[Float] = Array(count: numberOfPixels, repeatedValue: 0.0)
         var blueVector:[Float] = Array(count: numberOfPixels, repeatedValue: 0.0)
@@ -182,7 +189,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         vDSP_vfltu8(dataBuffer+1, 4, &greenVector, 1, vDSP_Length(numberOfPixels))
         vDSP_vfltu8(dataBuffer+2, 4, &redVector, 1, vDSP_Length(numberOfPixels))
         
-
+        
         
         // compute average per color
         var redAverage:Float = 0.0
@@ -194,11 +201,38 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         vDSP_meamgv(&blueVector, 1, &blueAverage, vDSP_Length(numberOfPixels))
         
         
+        
+        // convert to HSV ( hue, saturation, value )
+        // this gives faster, more accurate answer
+        var hue: CGFloat = 0.0
+        var saturation: CGFloat = 0.0
+        var brightness: CGFloat = 0.0
+        var alpha: CGFloat = 1.0
+        
+        var color: UIColor = UIColor(red: CGFloat(redAverage/255.0), green: CGFloat(greenAverage/255.0), blue: CGFloat(blueAverage/255.0), alpha: alpha)
+        color.getHue(&hue, saturation: &saturation, brightness: &brightness, alpha: &alpha)
+        
+        
+        
+        
+        // 5 count rolling average
+        let currentHueAverage = hue/movingAverageCount
+        movingAverageArray.removeAtIndex(0)
+        movingAverageArray.append(currentHueAverage)
+        
+        let movingAverage = movingAverageArray[0] + movingAverageArray[1] + movingAverageArray[2] + movingAverageArray[3] + movingAverageArray[4]
+        
+        
+        
+        
+        // send to graph and fft
         dispatch_async(dispatch_get_main_queue()){
-            self.collectDataForFFT(redAverage, green: greenAverage, blue: blueAverage)
-            self.graphView.addX(redAverage)
+            self.graphView.addX(Float(movingAverage))
+            self.collectDataForFFT(Float(movingAverage), green: Float(saturation), blue: Float(brightness))
         }
     }
+    
+    
     
     
     // grab data points from image
@@ -208,13 +242,13 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     // one color is plenty for heart rate
     // others are here only as setup for future projects
     func collectDataForFFT( red: Float, green: Float, blue: Float ){
-    
+        
         // first fill up array
         if  dataCount < windowSize {
             inputSignal[dataCount] = red
             dataCount++
             
-        // then pop oldest off top push newest onto end
+            // then pop oldest off top push newest onto end
         }else{
             
             inputSignal.removeAtIndex(0)
@@ -223,14 +257,14 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         
         
         
-        // call fft once per second
+        // call fft ~ once per second
         if  fftLoopCount > Int(fps) {
-            fftLoopCount = 0;
+            fftLoopCount = 0
             FFT()
             
         }else{ fftLoopCount++; }
-
-    
+        
+        
     }
     
     
@@ -245,7 +279,7 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         var zerosI = [Float](count: windowSizeOverTwo, repeatedValue: 0.0)
         var cplxData = DSPSplitComplex( realp: &zerosR, imagp: &zerosI )
         
-        var xAsComplex = UnsafePointer<DSPComplex>( inputSignal.withUnsafeBufferPointer { $0.baseAddress } )
+        let xAsComplex = UnsafePointer<DSPComplex>( inputSignal.withUnsafeBufferPointer { $0.baseAddress } )
         vDSP_ctoz( xAsComplex, 2, &cplxData, 1, vDSP_Length(windowSizeOverTwo) )
         
         
@@ -255,13 +289,9 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         
         
         
-        
-        
-        
         //calculate power
         var powerVector = [Float](count: windowSize, repeatedValue: 0.0)
         vDSP_zvmags(&cplxData, 1, &powerVector, 1, vDSP_Length(windowSizeOverTwo))
-        
         
         // find peak power and bin
         var power = 0.0 as Float
@@ -269,61 +299,28 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
         
         
         
-        ///////////////////////////////////////////////////////////////////
-        ////////////   calculate heart rate, ie pulse  ////////////////////
-        // skip hr under 35 when calculating power, then adjust bin count
-        let minHeartRate = 10       // 10 * bin size of 3.5 is 35
-        // skip hr over ~300 as junk
-        let maxHeartRate = Double(windowSizeOverTwo) / 2.0
+        
+        // calculate heart rate, ie pulse
+        // course bandwidth filter --- skip hr under/over unreasonable amounts
+        let minHeartRate = 20                                       // skip anything lower ~35 bpm
+        let maxHeartRate = Double(windowSizeOverTwo) / 4            // skip anything over ~225 bpm
         vDSP_maxvi(&powerVector+minHeartRate, 1, &power, &bin, vDSP_Length(maxHeartRate))
-        bin += 10
+        bin += vDSP_Length(minHeartRate)
         
         
-        // make sure we have at least 15 secs of data before pushing to user
+        
+        
+        // push heart rate data to the user
         let timeElapsed = NSDate().timeIntervalSinceDate(timeElapsedStart)
         timeLabel.text = NSString(format: "Seconds: %d", Int(timeElapsed)) as String
-
         
-        if timeElapsed > 15.0 {     // collect enough data to get a good reading
-    
-            // push the data to the user
-            // fps == hz
-            let binSize = fps * 60.0 / Float(windowSize)
-            let errorSize = fps * 60.0 / Float(windowSize)
-            var bpm = Float(bin) * fps * 60.0 / Float(windowSize)
-            
-            
-            // do we have another way to count peaks per minute?
-            // find derivative, count sign changes?
-            let dataPointsPerFiveSeconds = Int(fps * 10)
+        let binSize = fps * 60.0 / Float(windowSize)
+        let errorSize = fps * 60.0 / Float(windowSize)
         
-            var x1:[Float] = inputSignal
-            x1.removeAtIndex(0)
-
-            var dx:[Float] = Array(count: dataPointsPerFiveSeconds, repeatedValue: 0.0)
-            vDSP_vsub(inputSignal, 1, x1, 1, &dx, 1, vDSP_Length(dataPointsPerFiveSeconds))
+        let bpm = Float(bin) / Float(windowSize) * (fps * 60.0)
+        pulseLabel.text = ("\(Int(bpm))")
         
-            var indexCrossing:vDSP_Length = 0
-            var numberOfCrossings:vDSP_Length = 0
-            
-            vDSP_nzcros(dx, 1, vDSP_Length(dataPointsPerFiveSeconds), &indexCrossing, &numberOfCrossings, vDSP_Length(dataPointsPerFiveSeconds))
-            var heartRate = Int(numberOfCrossings / 2) * 6      // 10 * 6 = 60 seconds, two crossings per peak
-            
-            
-            println("fft says \(bpm), derivative says \(heartRate)")
-            
-            // sanity check data
-            let test:Int = heartRate - Int(bpm)
-            if abs(test) <= 5 {
-                var combinedScores = abs( (heartRate + Int(bpm)) / 2 )
-                pulseLabel.text = NSString(format: "Locked: Heart rate: %d  +/- 2", Int(bpm)) as String
-            }else{
-                pulseLabel.text = NSString(format: "Between %d - %d", Int(bpm), heartRate) as String
-            }
-            
-        }else{
-            pulseLabel.text = "collecting data...."
-        }
+        
     }
     
     
@@ -331,42 +328,42 @@ class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDele
     
     
     
-    
+    //////////////////////////////////////////////////////////////
+    // UI start/stop camera
+    //////////////////////////////////////////////////////////////
     @IBAction func stop(){
-        
-        stopUpdates = true
-        session.stopRunning()
+        session.stopRunning()           // stop camera
     }
     
     
     
     @IBAction func start(){
         
-        stopUpdates = false
-        cameraOn = true
-        
-        timeElapsedStart = NSDate()
-        
-        setupCaptureSession()
+        timeElapsedStart = NSDate()     // reset clock
+        setupCaptureSession()           // start camera
     }
     
     
     
     
     
+    
+    //////////////////////////////////////////////////////////
+    //    cleanup           //////////////////////////////////
+    //////////////////////////////////////////////////////////
     override func viewDidDisappear(animated: Bool){
         
         super.viewDidDisappear(animated)
         stop()
     }
     
-
     
-
+    
+    
     override func didReceiveMemoryWarning() {
         super.didReceiveMemoryWarning()
     }
-
-
+    
 }
+
 
